@@ -152,23 +152,165 @@ login thành công
 
 Đây là phần dễ rối nhất — chỉ nên học sau khi giai đoạn 1 + 3 đã chắc, vì nó ghép khái niệm Spring (giai đoạn 1) với khái niệm JWT (giai đoạn 3) vào cùng 1 bức tranh.
 
-### Filter là gì
+### Vấn đề cần giải quyết: chặn request TRƯỚC KHI vào Controller
 
-Hiểu đơn giản: 1 request đi qua **1 chuỗi filter** trước khi tới Controller, mỗi filter được quyền **chặn lại** hoặc **cho đi tiếp**. Giống như 1 dây chuyền kiểm tra an ninh nhiều trạm — qua được trạm này mới tới trạm kế, không qua được thì bị chặn ngay, không cần tới Controller.
+`GlobalExceptionHandler` chỉ chạy **sau khi** Controller đã xử lý xong và văng exception. Nhưng bảo mật cần chặn **sớm hơn thế** — 1 request không có JWT hợp lệ cần bị từ chối **trước khi** chạm vào bất kỳ dòng code nghiệp vụ nào (Controller/Service/Repository), tránh lãng phí tài nguyên và tránh rủi ro lộ logic nội bộ qua exception.
 
-### SecurityFilterChain
+### Servlet Filter — cơ chế nền tảng, có trước cả Spring
 
-Chỉ là "danh sách các filter bảo mật sẽ chạy, theo thứ tự nào" — bản thân nó không làm gì cụ thể, chỉ là cấu hình khai báo thứ tự.
+Đây là khái niệm thuộc chuẩn Servlet (Java EE/Jakarta EE gốc), **không phải Spring phát minh ra**. Ý tưởng: 1 request HTTP đi qua **1 chuỗi các Filter xếp hàng nối tiếp nhau**, trước khi tới được Servlet cuối cùng (trong Spring MVC, servlet đó chính là `DispatcherServlet` — thứ điều hướng request tới đúng `@Controller`):
+
+```
+Request  →  Filter 1  →  Filter 2  →  Filter 3  →  DispatcherServlet  →  Controller
+Response ←  Filter 1  ←  Filter 2  ←  Filter 3  ←  DispatcherServlet  ←  Controller
+```
+
+Mỗi Filter có 2 quyền:
+
+- **Chặn lại, không cho đi tiếp** — tự trả response luôn (ví dụ trả 401), không gọi tới Filter kế tiếp.
+- **Cho đi tiếp** — gọi `chain.doFilter(request, response)` để chuyển sang Filter kế tiếp trong chuỗi.
+
+```java
+// Ý tưởng 1 Filter thô, chưa phải Spring
+public class SimpleFilter implements Filter {
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) {
+        if (điều kiện không hợp lệ) {
+            // Chặn lại, không gọi chain.doFilter() -> request KHÔNG đi tiếp
+            ((HttpServletResponse) res).setStatus(401);
+            return;
+        }
+        chain.doFilter(req, res);  // Cho đi tiếp tới Filter kế
+    }
+}
+```
+
+Response cũng đi ngược lại qua đúng chuỗi Filter đó (theo thứ tự ngược), nên Filter còn có thể **sửa response** trước khi trả về client (ví dụ CORS filter thêm header `Access-Control-Allow-Origin` vào response).
+
+### Spring Security không viết lại cơ chế Filter — nó CHỈ LÀ 1 chuỗi Filter đặc biệt
+
+Đây là điểm quan trọng nhất để hiểu `SecurityFilterChain`: Spring Security bản chất là **1 tập hợp nhiều Filter con**, được Spring đóng gói và chèn vào đúng vị trí trong chuỗi Filter tổng của Servlet Container (Tomcat). Khi viết:
+
+```java
+@Bean
+public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    http
+        .csrf(csrf -> csrf.disable())
+        .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+        .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+        .authorizeHttpRequests(auth -> auth
+                .requestMatchers(PUBLIC_PATHS).permitAll()
+                .anyRequest().permitAll()
+        );
+    return http.build();
+}
+```
+
+Bạn **không** đang viết logic if/else thủ công như ví dụ `SimpleFilter` ở trên — bạn đang **cấu hình, lắp ráp sẵn** nhiều Filter con có sẵn của Spring Security (CSRF Filter, CORS Filter, Authorization Filter...), theo đúng thứ tự đã được Spring định sẵn là hợp lý (ví dụ: CORS phải chạy trước Authorization, vì cần xử lý preflight request trước khi kiểm tra quyền).
+
+`HttpSecurity http` — object nhận vào tham số (đây chính là Dependency Injection, Spring tự tạo sẵn đưa vào) — có vai trò như 1 "builder", mỗi lời gọi `.csrf(...)`, `.cors(...)`, `.sessionManagement(...)` là thêm/cấu hình 1 Filter con vào chuỗi cuối cùng. `http.build()` ở cuối mới thực sự ráp tất cả lại thành 1 `SecurityFilterChain` hoàn chỉnh.
+
+### Giải nghĩa từng dòng cấu hình — theo đúng cơ chế Filter vừa học
+
+**`.csrf(csrf -> csrf.disable())`**
+
+CSRF (Cross-Site Request Forgery) là kiểu tấn công lợi dụng cookie/session — trình duyệt tự động gửi kèm cookie có sẵn khi bạn vô tình bấm vào 1 link độc hại, khiến server tưởng đây là request hợp lệ từ bạn. Vì hệ thống dùng JWT thuần, không cookie/session (JWT phải gắn thủ công vào header `Authorization` mỗi lần, không tự động gửi kèm như cookie) → không có bề mặt tấn công CSRF → tắt Filter kiểm tra CSRF token đi cho gọn, không cần thiết. (Phân tích chi tiết vì sao xem mục "CSRF — phân tích sâu" bên dưới.)
+
+**`.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))`**
+
+Nói thẳng với Spring Security: "đừng bao giờ tự tạo `HttpSession` cho request nào cả, kể cả khi có code nào đó vô tình gọi `request.getSession()`". Đúng bản chất đã chọn từ đầu (JWT thuần) — mỗi request phải tự đủ thông tin chứng minh danh tính (qua JWT trong header), không dựa vào bất kỳ trạng thái nào server nhớ từ request trước.
+
+**`.authorizeHttpRequests(auth -> auth.requestMatchers(PUBLIC_PATHS).permitAll().anyRequest().permitAll())`**
+
+Đây chính là **Authorization Filter** — Filter cuối cùng trong chuỗi Security, có nhiệm vụ: nhìn vào path của request, đối chiếu với danh sách quy tắc đã khai (theo đúng thứ tự khai báo, quy tắc đầu tiên khớp sẽ áp dụng, các quy tắc sau không xét nữa), quyết định cho qua hay chặn.
+
+- `requestMatchers(PUBLIC_PATHS).permitAll()` — các path trong mảng `PUBLIC_PATHS` (`/api/webhooks/**`, `/api/auth/**`...) → luôn cho qua, bất kể có JWT hay không.
+- `anyRequest().permitAll()` — dòng tạm thời — mọi path còn lại cũng cho qua luôn. Đây là lý do trước khi có giai đoạn 5, test API qua Postman không cần gắn JWT vẫn chạy được — vì dòng này đang mở toang. Khi Giai đoạn 5 xong, dòng này đổi thành `.anyRequest().authenticated()` → Authorization Filter sẽ kiểm tra `SecurityContext` có `Authentication` hợp lệ hay không (đúng object mà `JwtAuthenticationFilter` sẽ set vào) — không có thì chặn, trả 401.
+
+### Vị trí JwtAuthenticationFilter sẽ chèn vào đâu trong chuỗi
+
+Khi viết Filter riêng để verify JWT, cần chèn nó vào đúng vị trí trong chuỗi — cụ thể là **trước** Authorization Filter (vì Authorization Filter cần đọc `SecurityContext` đã có `Authentication` rồi mới quyết định cho qua hay không — nếu chèn sau, Authorization Filter sẽ luôn thấy `SecurityContext` trống):
+
+```java
+http.addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
+```
+
+`UsernamePasswordAuthenticationFilter` là 1 Filter có sẵn của Spring Security (dùng cho login form truyền thống, không dùng tới vì không có login form HTML) — nhưng nó vẫn tồn tại trong chuỗi mặc định, dùng làm **điểm mốc tham chiếu** để nói "chèn Filter của tôi vào ngay trước vị trí này".
+
+### Tóm tắt toàn bộ luồng 1 request đi qua — ráp lại mọi thứ đã học
+
+```
+1. Request tới, Tomcat nhận (biết TCP/IP, HTTP)
+2. Đi qua chuỗi Filter của Servlet Container, trong đó có
+   FilterChainProxy (điểm vào của Spring Security)
+3. Bên trong đó, lần lượt qua các Filter con:
+   CORS Filter -> (sau này) JwtAuthenticationFilter -> Authorization Filter
+4. JwtAuthenticationFilter (giai đoạn 5): đọc header Authorization,
+   verify JWT (giai đoạn 3) -> set Authentication vào SecurityContext
+   (ThreadLocal, riêng theo thread)
+5. Authorization Filter: kiểm tra path + SecurityContext -> quyết định
+   cho qua hay trả 401
+6. Nếu qua được, request tới DispatcherServlet -> đúng @RestController
+7. Trong Controller/Service, khi save() Entity -> AuditingEntityListener
+   đọc lại đúng SecurityContext (giai đoạn 2) -> điền created_by
+```
 
 ### permitAll() vs authenticated()
 
 Quy tắc "path này không cần đăng nhập" (`permitAll()`) vs "path này bắt buộc đăng nhập" (`authenticated()`). Ví dụ `/api/auth/login` phải `permitAll()` (chưa đăng nhập thì làm sao gọi API cần đăng nhập để login), còn `/api/persons` nên `authenticated()`.
 
-### SessionCreationPolicy.STATELESS
-
-Nói với Spring **"đừng tạo session/cookie gì cả, mọi request tự chứng minh danh tính qua JWT trong header"**. Đây là điểm khác biệt căn bản so với web truyền thống (nơi server tạo session, lưu trong bộ nhớ/DB, client chỉ gửi session ID qua cookie) — với JWT, server không cần nhớ gì cả giữa các request, mọi thông tin cần thiết đã nằm sẵn trong chính token gửi lên mỗi lần.
-
 **Thực hành gợi ý**: trong `SecurityConfig` đã viết, thử đổi `PUBLIC_PATHS` thêm/bớt 1 path, chạy app, gọi thử qua Postman xem path đó có bị chặn 401 đúng như mong đợi không.
+
+### CSRF — phân tích sâu: tại sao tắt được, và khi nào không nên tắt
+
+Câu hỏi hay dễ gây nhầm: "session/cookie" và "JWT" **không phải 2 thứ đối lập hoàn toàn** — chúng nằm trên **2 trục độc lập**, có thể trộn lẫn với nhau. Tách ra sẽ dễ hiểu hơn nhiều.
+
+**Trục 1: Nơi lưu "ai đang đăng nhập" — Stateful vs Stateless**
+
+| | Session (Stateful) | JWT (Stateless) |
+|---|---|---|
+| Server có nhớ gì không | Có — giữ 1 bảng/bộ nhớ sessionId → userInfo | Không — mọi thông tin nằm ngay trong token, server chỉ verify chữ ký |
+| Muốn "logout ngay lập tức" | Dễ — xoá session khỏi bộ nhớ server | Khó — token cũ vẫn hợp lệ tới khi tự hết hạn |
+
+**Trục 2: Cách token/session-id "đi kèm" mỗi request — Cookie vs Header**
+
+| | Cookie | Header (`Authorization: Bearer ...`) |
+|---|---|---|
+| Ai gắn nó vào request | Trình duyệt **tự động** gắn — không cần code JS nào làm việc này | Phải code JS **tự tay** gắn vào mỗi request (fetch, axios interceptor...) |
+| Gắn cả khi nào | Cả khi bạn **không chủ ý** gửi request (ví dụ bị dụ bấm vào 1 link/form độc hại từ trang web khác) | Chỉ gắn khi code của chính app bạn **chủ động** thêm vào |
+
+**Đây chính là chỗ mấu chốt — CSRF liên quan tới Trục 2, KHÔNG liên quan tới Trục 1**
+
+Rất nhiều người nhầm rằng "dùng JWT thì không bao giờ bị CSRF" — sai, chỉ đúng khi JWT đi qua **Header**. Nếu JWT đi qua **Cookie** (1 số hệ thống làm vậy, để tận dụng cookie tự động gửi, đỡ phải code JS gắn header thủ công), thì CSRF quay trở lại, dù vẫn đang "dùng JWT":
+
+```
+Kịch bản tấn công (JWT lưu trong Cookie):
+1. Bạn đăng nhập app-that.com -> server set-cookie chứa JWT
+2. Bạn (vẫn đang đăng nhập) vô tình mở tab khác, vào trang xau.com
+3. xau.com có 1 form ẩn, tự động submit tới app-that.com/api/transfer-money
+4. Trình duyệt "tốt bụng" TỰ ĐỘNG gắn cookie JWT của app-that.com vào
+   request đó, vì request đang gửi TỚI đúng domain app-that.com
+5. Server app-that.com verify JWT -> hợp lệ (chữ ký đúng, chưa hết hạn)
+   -> XỬ LÝ LỆNH CHUYỂN TIỀN, dù chính bạn không hề chủ ý gửi request này
+```
+
+Điểm quan trọng: **JWT signature hoàn toàn không giúp gì ở đây** — token đó thật 100%, không bị sửa gì cả, chỉ là nó bị gửi đi không theo ý muốn của chủ nhân. CSRF không phải tấn công "giả mạo token", mà là **"lừa trình duyệt tự gửi request thay bạn"** — đây là lý do CSRF liên quan tới cơ chế tự động gắn của cookie, không liên quan tới JWT hay session.
+
+**4 tổ hợp thực tế:**
+
+| Tổ hợp | Có CSRF risk? | Ghi chú |
+|---|---|---|
+| Session + Cookie (kiểu truyền thống, PHP/Rails cũ) | **Có** | Kịch bản kinh điển, cần CSRF token để chống |
+| JWT + Header (đúng cách hệ thống này đang làm) | **Không** | Trang độc hại không có cách nào "ra lệnh" cho JS của app tự gắn header vào request nó tự tạo |
+| JWT + Cookie (hybrid, 1 số hệ thống chọn vì tiện) | **Có** | Như kịch bản trên — vẫn dùng JWT nhưng transport qua cookie, CSRF quay lại |
+| Session + Header (hiếm gặp) | **Không** | Ít ai làm vậy vì mất hết lợi ích "tiện" của cookie, nhưng về lý thuyết an toàn CSRF |
+
+**"Chỉ dùng session/cookie thì sao"** — đây chính là ô đầu tiên trong bảng: **luôn có CSRF risk**, vì bản chất cookie tự động gắn là điều kiện đủ để tấn công này xảy ra, không phụ thuộc nội dung cookie là session ID hay gì khác.
+
+**Nếu 1 hệ thống thực sự "kết hợp cả 3" — thường nghĩa là gì trong thực tế**
+
+Thường gặp nhất: web app dùng **cookie `httpOnly`** để lưu refresh token (chống JS đọc trộm token qua XSS), còn **access token vẫn qua header** cho mỗi API call. Đây là pattern khá phổ biến và an toàn hơn so với lưu cả 2 loại token trong `localStorage` (localStorage dễ bị đọc trộm nếu có lỗ hổng XSS). Nhưng vì refresh token đi qua cookie, API nhận refresh token đó (`/api/auth/refresh`) **vẫn cần CSRF protection riêng** — dù các API khác (dùng access token qua header) thì không cần.
+
+**Kết luận cho câu hỏi gốc**: `.csrf().disable()` an toàn trong `SecurityConfig` hiện tại vì hệ thống dùng JWT thuần qua Header — CSRF khai thác cơ chế **tự động gắn** của cookie, còn JWT trong header phải được code **chủ động** gắn vào, nên 1 trang độc hại không có cách nào "ra lệnh" cho JS của app tự thêm header đó vào request nó tự tạo ra. Vô hiệu hoá CSRF Filter là đúng đắn — không phải bỏ qua bước bảo mật cần thiết, mà vì bề mặt tấn công đó không tồn tại trong kiến trúc này. Nếu sau này thêm cookie (ví dụ refresh token qua cookie `httpOnly`), câu trả lời sẽ khác — cần bật lại CSRF protection riêng cho đúng route đó.
 
 ---
 
@@ -283,9 +425,78 @@ Chứa thông tin phụ trợ về request, không phải về user — ví dụ
 
 ## Giai đoạn 5 — Ghép JWT vào Spring Security (JwtAuthenticationFilter)
 
-Đây là chỗ giai đoạn 3 + 4 gặp nhau — chỉ học khi cả 2 đã vững.
+Đây là chỗ giai đoạn 3 + 4 gặp nhau — chỉ học khi cả 2 đã vững. Đây là lúc mọi kiến thức rời rạc (Filter chain, JWT sign/verify, SecurityContext/ThreadLocal, AuditorAware) ráp lại thành code chạy thật.
 
 Filter tự viết (`OncePerRequestFilter`) đọc header `Authorization`, verify JWT (dùng lại kiến thức giai đoạn 3), rồi tự tay `SecurityContextHolder.getContext().setAuthentication(...)` — đây chính là bước biến **"1 JWT hợp lệ"** thành **"Spring Security công nhận đây là user đã đăng nhập"**. Đây cũng là lúc `AuditorAware` (giai đoạn 2) mới thực sự có dữ liệu để điền `created_by` — trước giai đoạn này, không có ai đăng nhập nên không có gì để điền.
+
+### Việc cần làm, theo đúng thứ tự phụ thuộc
+
+```
+1. JwtTokenProvider.java        -- sign() lúc login, verify() lúc có request
+2. JwtAuthenticationFilter.java -- đọc header, gọi verify(), set SecurityContext
+3. Sửa SecurityConfig.java      -- addFilterBefore(...), đổi permitAll -> authenticated
+```
+
+### 3 điều cần quyết định trước khi code JwtTokenProvider
+
+`JwtTokenProvider` cần quyết định trước 3 điều (đúng những gì đã học ở Giai đoạn 3):
+
+1. **`secretKey` lấy từ đâu** — hardcode (tuyệt đối không) hay từ biến môi trường (`application.yaml` → `${JWT_SECRET}`, khớp với cách làm với `DB_URL`)?
+2. **Access token sống bao lâu, refresh token sống bao lâu** — con số cụ thể (ví dụ 15 phút / 7 ngày như đã bàn ở giai đoạn 3, hay muốn số khác)?
+3. **Payload (claims) chứa gì ngoài `sub` (userId)** — có cần thêm `email`, `role` vào token luôn để đỡ query DB mỗi request không, hay giữ tối giản chỉ có `userId`?
+
+### Vấn đề cần giải quyết ở giai đoạn này — trước khi code
+
+4 giai đoạn trước học riêng lẻ: JWT là gì (giai đoạn 3), Filter chain hoạt động sao (giai đoạn 4), `SecurityContext` dựa trên `ThreadLocal` (giai đoạn 2 phần mở rộng). Giờ cần hiểu chúng **nối với nhau ở đâu** — cụ thể là: **ai** là người đọc JWT từ header, verify nó, rồi set vào `SecurityContext` để Authorization Filter (giai đoạn 4) và `AuditorAware` (giai đoạn 2) dùng được?
+
+Câu trả lời: 1 Filter tự viết, đặt tên quy ước là `JwtAuthenticationFilter` — nó là **mảnh ghép còn thiếu** nối giữa "JWT trong header" và "SecurityContext có Authentication".
+
+### OncePerRequestFilter — lớp cha cần hiểu trước
+
+Spring cung cấp sẵn 1 abstract class tên `OncePerRequestFilter`, kế thừa từ Servlet Filter gốc (đã học khái niệm Filter ở giai đoạn 4). Điểm khác biệt duy nhất nó thêm vào: **đảm bảo logic verify chỉ chạy đúng 1 lần cho mỗi request**, dù trong 1 số trường hợp phức tạp (forward/include request nội bộ), Servlet Container có thể vô tình gọi filter nhiều lần cho cùng 1 request gốc.
+
+```java
+public abstract class OncePerRequestFilter extends GenericFilterBean {
+    // bạn chỉ cần override đúng 1 method:
+    protected abstract void doFilterInternal(
+        HttpServletRequest request,
+        HttpServletResponse response,
+        FilterChain filterChain
+    );
+}
+```
+
+### Logic bên trong filter này làm gì — từng bước, nối lại kiến thức cũ
+
+**Bước 1 — Đọc header `Authorization`** (đúng cấu trúc HTTP request đã học ở phần đầu, header là 1 trong 4 thành phần request):
+
+```
+Authorization: Bearer eyJhbGci...
+```
+
+Filter cần: kiểm tra header có tồn tại không, có bắt đầu bằng chữ `"Bearer "` không (đây là quy ước chuẩn, không phải Spring tự đặt ra), rồi cắt bỏ chữ `"Bearer "` để lấy đúng chuỗi token thuần.
+
+**Bước 2 — Verify token** (đúng cơ chế HMAC-SHA256 đã học ở giai đoạn 3 — tính lại signature, so sánh, kiểm tra `exp` chưa hết hạn). Nếu verify thất bại (sai chữ ký, hết hạn, sai định dạng) → filter **không set gì cả**, để request đi tiếp với `SecurityContext` trống — quan trọng: **không tự trả lỗi 401 ngay tại đây**, mà để cho Authorization Filter (giai đoạn 4, chạy sau filter này trong chuỗi) tự quyết định chặn dựa trên rule `authenticated()` — đây là cách phân chia trách nhiệm rõ ràng: filter này chỉ lo **"xác định danh tính"**, không lo **"có được phép truy cập path này không"**.
+
+**Bước 3** — Nếu verify thành công, lấy `userId` ra từ payload (đúng phần payload JWT đã học — claim `sub`).
+
+**Bước 4** — Tạo object `Authentication`, set vào `SecurityContext` — đây chính là hành động ghi vào "ngăn kéo riêng của thread hiện tại" (đúng cơ chế `ThreadLocal` đã học ở giai đoạn 2 mở rộng):
+
+```java
+SecurityContextHolder.getContext().setAuthentication(authenticationObject);
+```
+
+Từ dòng này trở đi, trong cùng luồng xử lý request đó (cùng 1 thread — Spring MVC xử lý 1 request trọn vẹn trên 1 thread, không nhảy thread giữa chừng), bất kỳ đoạn code nào gọi `SecurityContextHolder.getContext().getAuthentication()` — kể cả `AuditorAware` đã viết từ trước, dù nó được viết trước khi filter này tồn tại — sẽ tự động lấy được đúng thông tin user vừa xác thực. **Đây chính là lý do code `AuditorAware` viết từ giai đoạn 2 không cần sửa gì cả khi giai đoạn 5 hoàn thành** — nó đã sẵn sàng chờ đúng dữ liệu này từ đầu.
+
+**Bước 5** — Gọi `filterChain.doFilter(request, response)` — đúng khái niệm "cho đi tiếp" đã học ở giai đoạn 4, chuyển sang Authorization Filter kế tiếp trong chuỗi.
+
+### Vì sao filter này phải đặt TRƯỚC Authorization Filter — nhắc lại lý do, giờ có đủ ngữ cảnh để thấy rõ
+
+Nếu đặt sau Authorization Filter: Authorization Filter chạy trước, kiểm tra `SecurityContext` lúc đó **còn trống trơn** (vì `JwtAuthenticationFilter` chưa kịp set gì) → mọi request đều bị coi là "chưa đăng nhập" → luôn trả 401, kể cả khi JWT hoàn toàn hợp lệ. **Thứ tự trong chuỗi Filter quan trọng tuyệt đối, không phải chi tiết tuỳ ý.**
+
+### Điều gì xảy ra với các claim khác trong token (email, role...)
+
+Nếu `JwtTokenProvider` nhúng thêm `email`/`role` vào payload lúc ký, thì ở Bước 3, filter có thể đọc luôn các claim đó, đóng gói vào 1 object `CustomUserDetails` thay vì chỉ có `userId` trần — đây chính là điểm cần ghi TODO trong `AuditorAware` từ giai đoạn 2 ("thay bằng cách lấy đúng UUID từ principal thật sau khi có `CustomUserDetails`") — ghi chú đó đang **chờ đúng mảnh ghép này** hoàn thiện.
 
 ### JwtTokenProvider — sinh và verify JWT
 
